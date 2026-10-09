@@ -1,0 +1,195 @@
+<?php
+/**
+ * admin/workers.php  —  workforce, teams and vehicles
+ */
+require_once __DIR__ . '/../includes/auth.php';
+require_role('admin');
+
+$workers = db_all(
+    'SELECT w.*, u.full_name, u.email, u.phone,
+            t.team_name, t.waste_types AS team_waste_types,
+            v.vehicle_number, v.vehicle_type, v.capacity_kg,
+            (SELECT COUNT(*) FROM waste_requests r
+              WHERE r.assigned_worker_id = w.id
+                AND r.status IN ("assigned","scheduled","in_progress")) AS open_load,
+            (SELECT COUNT(*) FROM waste_requests r
+              WHERE r.assigned_worker_id = w.id
+                AND r.status IN ("collected","verified")) AS done_count,
+            (SELECT AVG(citizen_rating) FROM waste_requests r
+              WHERE r.assigned_worker_id = w.id AND r.citizen_rating IS NOT NULL) AS avg_rating
+       FROM workers w
+       JOIN users u            ON u.id = w.user_id
+       LEFT JOIN teams t       ON t.id = w.team_id
+       LEFT JOIN vehicles v    ON v.id = w.vehicle_id
+      WHERE w.status <> "removed"
+      ORDER BY FIELD(w.status,"available","busy","offline"), w.current_load, u.full_name'
+);
+
+$teams = db_all(
+    'SELECT t.*, COUNT(w.id) AS members
+       FROM teams t
+       LEFT JOIN workers w ON w.team_id = t.id AND w.status <> "removed"
+      GROUP BY t.id
+      ORDER BY t.team_name'
+);
+
+$vehicles = db_all(
+    'SELECT v.*, t.team_name
+       FROM vehicles v
+       LEFT JOIN teams t ON t.id = v.team_id
+      ORDER BY v.vehicle_number'
+);
+
+$statusColor = ['available' => 'success', 'busy' => 'warning', 'offline' => 'secondary', 'on_leave' => 'info'];
+
+$pageTitle    = 'Workers & Teams';
+$pageSubtitle = count($workers) . ' active team(s) · ' . count($teams) . ' crew(s) · ' . count($vehicles) . ' vehicle(s)';
+$activeNav    = 'workers';
+
+require __DIR__ . '/../includes/header.php';
+?>
+
+<div class="row g-3 mb-3">
+  <?php
+  $kpis = [
+      ['Available now', count(array_filter($workers, fn($w) => $w['status'] === 'available')), 'bi-check-circle', 'success'],
+      ['On route',       count(array_filter($workers, fn($w) => $w['status'] === 'busy')),        'bi-truck', 'warning'],
+      ['Open pickups',   array_sum(array_map(fn($w) => (int) $w['open_load'], $workers)),           'bi-list-check', 'primary'],
+      ['Collected total',array_sum(array_map(fn($w) => (int) $w['done_count'], $workers)),          'bi-patch-check', 'success'],
+  ];
+  foreach ($kpis as [$label, $value, $icon, $color]): ?>
+    <div class="col-6 col-xl-3">
+      <div class="kpi">
+        <div class="kpi-label"><?= e($label) ?></div>
+        <div class="kpi-value text-<?= $color ?>"><?= (int) $value ?></div>
+        <div class="kpi-foot"><i class="bi <?= e($icon) ?> me-1"></i>live from the field</div>
+      </div>
+    </div>
+  <?php endforeach; ?>
+</div>
+
+<div class="card card-soft mb-3">
+  <div class="card-body">
+    <h5 class="section-title">Field teams</h5>
+    <div class="table-responsive">
+      <table class="table align-middle sw-table mb-0">
+        <thead>
+          <tr><th>Worker</th><th>Team</th><th>Vehicle</th><th>Status</th><th>Load</th>
+              <th>Performance</th><th>Rating</th><th>Contact</th><th>Last fix</th><th class="text-end"></th></tr>
+        </thead>
+        <tbody>
+          <?php foreach ($workers as $w):
+              $pct = $w['max_load'] ? round($w['current_load'] / $w['max_load'] * 100) : 0;
+              $col = $statusColor[$w['status']] ?? 'secondary'; ?>
+            <tr>
+              <td>
+                <div class="d-flex align-items-center gap-2">
+                  <span class="avatar-circle"><?= e(mb_strtoupper(mb_substr($w['full_name'], 0, 1))) ?></span>
+                  <div>
+                    <div class="fw-600" style="font-size:.86rem"><?= e($w['full_name']) ?></div>
+                    <div class="text-muted" style="font-size:.72rem"><?= e($w['worker_code']) ?></div>
+                  </div>
+                </div>
+              </td>
+              <td style="font-size:.82rem"><?= e($w['team_name'] ?: '—') ?>
+                <div class="text-muted text-truncate" style="font-size:.72rem;max-width:150px">
+                  <?= e(str_replace(',', ', ', $w['team_waste_types'] ?: 'general')) ?>
+                </div>
+              </td>
+              <td style="font-size:.8rem"><?= e($w['vehicle_number'] ?: '—') ?>
+                <div class="text-muted" style="font-size:.72rem">
+                  <?= e($w['vehicle_type'] ?: '') ?><?= $w['capacity_kg'] ? ' · ' . (int) $w['capacity_kg'] . 'kg' : '' ?>
+                </div>
+              </td>
+              <td><span class="pill bg-<?= $col ?>-subtle text-<?= $col ?>"><?= e(ucfirst($w['status'])) ?></span></td>
+              <td style="min-width:120px">
+                <div class="d-flex justify-content-between" style="font-size:.74rem">
+                  <span><?= (int) $w['current_load'] ?>/<?= (int) $w['max_load'] ?></span>
+                  <span class="text-muted"><?= $pct ?>%</span>
+                </div>
+                <div class="progress progress-thin">
+                  <div class="progress-bar <?= $pct >= 90 ? 'bg-danger' : ($pct >= 60 ? 'bg-warning' : 'bg-success') ?>"
+                       style="width:<?= min(100, $pct) ?>%"></div>
+                </div>
+                <div class="text-muted" style="font-size:.7rem"><?= (int) $w['open_load'] ?> open pickup(s)</div>
+              </td>
+              <td style="font-size:.82rem">
+                <span class="text-success fw-600"><?= (int) $w['done_count'] ?></span> collected
+                <div class="text-muted" style="font-size:.7rem"><?= (int) $w['total_collected'] ?> all time</div>
+              </td>
+              <td style="font-size:.82rem">
+                <?php if ($w['avg_rating']): ?>
+                  <span class="text-warning"><i class="bi bi-star-fill"></i> <?= round((float) $w['avg_rating'], 1) ?></span>
+                <?php else: ?>
+                  <span class="text-muted">—</span>
+                <?php endif; ?>
+              </td>
+              <td style="font-size:.78rem">
+                <?= e($w['phone'] ?: '—') ?>
+                <div class="text-muted text-truncate" style="font-size:.7rem;max-width:140px"><?= e($w['email']) ?></div>
+              </td>
+              <td class="text-muted" style="font-size:.74rem">
+                <?= $w['latitude']
+                    ? number_format((float) $w['latitude'], 4) . '<br>' . number_format((float) $w['longitude'], 4)
+                    : 'no fix' ?>
+              </td>
+              <td class="text-end">
+                <a href="<?= e(APP_URL) ?>/admin/assignments.php" class="btn btn-sm btn-light border" title="Assign work">
+                  <i class="bi bi-person-gear"></i>
+                </a>
+              </td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="card card-soft h-100">
+      <div class="card-body">
+        <h5 class="section-title">Crews</h5>
+        <?php foreach ($teams as $t): ?>
+          <div class="d-flex align-items-center gap-2 py-2 border-bottom">
+            <span class="kpi-icon"><i class="bi bi-people"></i></span>
+            <div class="flex-grow-1 min-w-0">
+              <div class="fw-600" style="font-size:.86rem"><?= e($t['team_name']) ?>
+                <span class="text-muted fw-normal">· <?= e($t['team_code']) ?></span></div>
+              <div class="text-muted text-truncate" style="font-size:.74rem">
+                Handles: <?= e(str_replace(',', ', ', $t['waste_types'] ?: 'general')) ?>
+              </div>
+            </div>
+            <span class="pill bg-secondary-subtle text-secondary"><?= (int) $t['members'] ?> member(s)</span>
+            <span class="pill bg-light border text-muted">max <?= (int) $t['max_load'] ?></span>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card card-soft h-100">
+      <div class="card-body">
+        <h5 class="section-title">Fleet</h5>
+        <?php foreach ($vehicles as $v):
+            $vcol = ['available' => 'success', 'in_use' => 'warning', 'maintenance' => 'danger'][$v['vehicle_status']] ?? 'secondary'; ?>
+          <div class="d-flex align-items-center gap-2 py-2 border-bottom">
+            <span class="kpi-icon"><i class="bi bi-truck"></i></span>
+            <div class="flex-grow-1 min-w-0">
+              <div class="fw-600" style="font-size:.86rem"><?= e($v['vehicle_number']) ?></div>
+              <div class="text-muted" style="font-size:.74rem">
+                <?= e($v['vehicle_type']) ?> · <?= (int) $v['capacity_kg'] ?> kg ·
+                <?= e($v['team_name'] ?: 'unassigned') ?>
+              </div>
+            </div>
+            <span class="pill bg-<?= $vcol ?>-subtle text-<?= $vcol ?>"><?= e(ucfirst(str_replace('_', ' ', $v['vehicle_status']))) ?></span>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    </div>
+  </div>
+</div>
+
+<?php require __DIR__ . '/../includes/footer.php';

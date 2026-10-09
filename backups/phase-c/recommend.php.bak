@@ -1,0 +1,218 @@
+<?php
+/**
+ * includes/recommend.php
+ * ------------------------------------------------------------------
+ * SMART WORKER ASSIGNMENT ENGINE
+ *
+ * Scores every worker for a given request using four weighted criteria
+ * and returns a ranked recommendation list:
+ *
+ *   Distance Score      (max 40)  closer truck = better
+ *   Availability Score  (max 25)  available >> busy >> offline
+ *   Workload Score      (max 20)  prefer workers with spare capacity
+ *   Compatibility Score (max 15)  team must handle this waste type
+ *                                                  -----------
+ *                                                  TOTAL 0 - 100
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/functions.php';
+
+/**
+ * Does a team's declared waste-type list cover the requested category?
+ * "all" means the team is a general purpose team.
+ */
+function team_handles_type(?string $teamWasteTypes, string $wasteType): bool
+{
+    $list = array_map('trim', explode(',', strtolower((string) $teamWasteTypes)));
+    if (!$list || $list === ['']) {
+        return true;
+    }
+    return in_array('all', $list, true) || in_array(strtolower($wasteType), $list, true);
+}
+
+/** Human label for the compatibility result. */
+function compatibility_label(bool $ok, string $wasteType): array
+{
+    if ($ok) {
+        return ['compatible' => true, 'note' => 'Team handles ' . waste_meta($wasteType)['label']];
+    }
+    return ['compatible' => false, 'note' => 'Team is NOT equipped for ' . waste_meta($wasteType)['label']];
+}
+
+/**
+ * Rank workers for a request.
+ *
+ * @param array  $request  waste_requests row
+ * @param int    $limit    how many recommendations to return
+ * @return array List of worker rows with score + reason columns added.
+ */
+function recommend_workers(array $request, int $limit = 5): array
+{
+    $rLat   = (float) ($request['latitude'] ?? 0);
+    $rLng   = (float) ($request['longitude'] ?? 0);
+    $waste  = (string) $request['waste_type'];
+    $qty    = (string) ($request['quantity'] ?? 'small');
+
+    $workers = db_all(
+        'SELECT w.*, u.full_name, u.phone AS user_phone, u.email,
+                t.team_name, t.waste_types AS team_waste_types,
+                v.vehicle_number, v.vehicle_type, v.capacity_kg
+           FROM workers w
+           JOIN users u        ON u.id = w.user_id
+           LEFT JOIN teams   t ON t.id = w.team_id
+           LEFT JOIN vehicles v ON v.id = w.vehicle_id
+          WHERE w.status <> "removed"
+          ORDER BY w.id'
+    );
+
+    $results = [];
+
+    // Furthest worker distance is used to normalise the distance score.
+    $maxDist = 1.0;
+    $dists   = [];
+    foreach ($workers as $w) {
+        $d = ($rLat && $rLng && $w['latitude'] !== null && $w['longitude'] !== null)
+            ? haversine_km($rLat, $rLng, (float) $w['latitude'], (float) $w['longitude'])
+            : null;
+        $dists[(int) $w['id']] = $d;
+        if ($d !== null && $d > $maxDist) {
+            $maxDist = $d;
+        }
+    }
+
+    foreach ($workers as $w) {
+        $wid  = (int) $w['id'];
+        $dist = $dists[$wid];
+
+        // --- Offline workers are never recommended -------------------------
+        if ($w['status'] === 'offline' || $w['availability'] === 'offline') {
+            $results[] = worker_row_with_score($w, 0, $dist, 0, 0, 0,
+                'Worker is offline', 'critical');
+            continue;
+        }
+
+        // --- 1. Distance (max 40) -----------------------------------------
+        if ($dist === null) {
+            $distanceScore = 15; // unknown location: give a neutral half score
+            $distanceNote  = 'Worker GPS location unknown';
+        } else {
+            $distanceScore = (int) max(0, round(40 * (1 - ($dist / max($maxDist * 1.2, 1)))));
+            $distanceNote  = number_format($dist, 1) . ' km away';
+        }
+
+        // --- 2. Availability (max 25) -------------------------------------
+        $availabilityScore = ['available' => 25, 'busy' => 10, 'offline' => 0][$w['availability']] ?? 10;
+        $availabilityNote  = ucfirst((string) $w['availability']);
+
+        // --- 3. Workload (max 20) -----------------------------------------
+        $current = (int) $w['current_load'];
+        $maxLoad = (int) ($w['max_load'] ?: 5);
+        $ratio   = $maxLoad > 0 ? $current / $maxLoad : 1.0;
+        if ($ratio >= 1.0) {
+            $workloadScore = 0;
+            $workloadNote  = 'Fully booked (' . $current . '/' . $maxLoad . ')';
+        } else {
+            $workloadScore = (int) round(20 * (1 - $ratio));
+            $workloadNote  = $current . '/' . $maxLoad . ' pickups pending';
+        }
+
+        // --- 4. Waste-type compatibility (max 15) -------------------------
+        $compatible     = team_handles_type($w['team_waste_types'] ?? 'all', $waste);
+        $compatInfo     = compatibility_label($compatible, $waste);
+        $compatScore    = $compatible ? 15 : 0;
+
+        // Vehicle suitability for bulky loads.
+        $needsHeavy     = in_array($qty, ['large', 'bulk'], true);
+        $vehicleHeavy   = in_array(strtolower((string) ($w['vehicle_type'] ?? '')), ['truck', 'tipper', 'tempo'], true);
+        if ($needsHeavy && !$vehicleHeavy) {
+            $compatScore = max(0, $compatScore - 7);
+            $compatInfo['note'] .= ' — light vehicle for a ' . $qty . ' load';
+        }
+
+        // --- Total ---------------------------------------------------------
+        $total = $distanceScore + $availabilityScore + $workloadScore + $compatScore;
+
+        // Flag the shape of the recommendation for the UI badge.
+        $badge = 'neutral';
+        if ($total >= 75)      $badge = 'success';
+        elseif ($total >= 55)  $badge = 'primary';
+        elseif ($total >= 40)  $badge = 'warning';
+        elseif ($total > 0)    $badge = 'danger';
+
+        $results[] = worker_row_with_score(
+            $w,
+            $total,
+            $dist,
+            $distanceScore,
+            $availabilityScore,
+            $workloadScore,
+            $compatInfo['note'],
+            $badge,
+            $compatScore
+        );
+    }
+
+    // Sort by score desc, then by distance asc.
+    usort($results, function ($a, $b) {
+        if ($a['score'] === $b['score']) {
+            $da = $a['distance_km'] ?? 9999;
+            $db = $b['distance_km'] ?? 9999;
+            return $da <=> $db;
+        }
+        return $b['score'] <=> $a['score'];
+    });
+
+    return array_slice($results, 0, $limit);
+}
+
+/** Attach the computed fields to a worker row. */
+function worker_row_with_score(array $w, int $score, ?float $dist, int $dScore, int $aScore, int $wlScore, string $compatNote, string $badge, int $compatScore = 0): array
+{
+    $w['score']             = $score;
+    $w['distance_km']       = $dist;
+    $w['distance_score']    = $dScore;
+    $w['availability_score'] = $aScore;
+    $w['workload_score']    = $wlScore;
+    $w['compat_score']      = $compatScore;
+    $w['compat_note']       = $compatNote;
+    $w['compatibility_note'] = $compatNote;
+    $w['badge']             = $badge;
+    $w['eta_minutes']       = $dist !== null ? estimate_drive_minutes($dist) : null;
+    // A flat breakdown so the "why this team?" modal never has to guess.
+    $w['breakdown'] = [
+        ['label' => 'Distance',    'points' => $dScore,   'max' => 40,
+         'note' => $dist !== null ? round($dist, 2) . ' km away' : 'no GPS fix yet'],
+        ['label' => 'Availability', 'points' => $aScore,   'max' => 25],
+        ['label' => 'Workload',    'points' => $wlScore,  'max' => 20],
+        ['label' => 'Compatibility','points' => $compatScore, 'max' => 15, 'note' => $compatNote],
+    ];
+    return $w;
+}
+
+/**
+ * When a worker is assigned, the worker load goes up and the status
+ * flips to busy once the cap is reached.
+ */
+function bump_worker_load(int $workerId, int $delta = 1): void
+{
+    // MySQL evaluates SET assignments left to right, so the flag columns must
+    // be computed *before* current_load moves — otherwise the delta is counted
+    // twice.
+    db_query(
+        'UPDATE workers
+            SET status       = IF(
+                                    status = "available"
+                                    AND GREATEST(0, current_load + ?) >= GREATEST(1, IFNULL(max_load, 5)),
+                                    "busy", status),
+                availability = IF(
+                                    status = "available"
+                                    AND GREATEST(0, current_load + ?) >= GREATEST(1, IFNULL(max_load, 5)),
+                                    "busy", availability),
+                current_load = GREATEST(0, current_load + ?),
+                updated_at   = NOW()
+          WHERE id = ?',
+        [$delta, $delta, $delta, $workerId]
+    );
+}

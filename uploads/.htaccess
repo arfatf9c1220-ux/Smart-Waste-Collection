@@ -1,0 +1,10 @@
+# Uploaded images must never be executed as code.
+# This stops a crafted .php.jpg / .phtml upload from running on the server.
+php_flag engine off
+
+<FilesMatch "\.(?i:php|phtml|php3|php4|php5|php7|phps|cgi|pl|py|sh|htaccess)$">
+    Require all denied
+</FilesMatch>
+
+Options -Indexes -ExecCGI
+AddType text/plain .php .phtml .php3 .php4 .php5 .php7 .phps .pl .py

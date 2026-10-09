@@ -1,0 +1,399 @@
+<?php
+/**
+ * includes/planner.php
+ * ------------------------------------------------------------------
+ * COLLECTION PLAN / ROUTE OPTIMISATION ENGINE
+ *
+ * Given a worker (team + vehicle) and a set of requests, this file works
+ * out the smartest visiting order.
+ *
+ * Algorithm: PRIORITY-SEEDED NEAREST NEIGHBOUR
+ *   1. The highest priority request becomes STOP 1 (it is the most urgent).
+ *   2. From the current position we look at every unvisited request and score
+ *      them with:   cost = distance_km  -  (priority_score / 100) * PRIORITY_KM
+ *      i.e. travelling 1 km further to reach a much more urgent request is
+ *      worth it, but a low priority request never jumps a very close one.
+ *   3. Pick the cheapest candidate, move there, repeat until all are visited.
+ *
+ * This is a greedy heuristic: it is fast, deterministic and easy to explain,
+ * which is exactly what a route planner demo needs.
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/functions.php';
+
+/** How many km of travel is "worth" jumping to a higher priority request. */
+const PRIORITY_KM = 3.0;
+
+/** Average minutes spent on site per pickup (collection + photo proof). */
+const SERVICE_MINUTES = 12;
+
+/**
+ * Order the given requests into an optimal-ish sequence.
+ *
+ * @param array $requests Request rows (must have id, latitude, longitude, priority_score)
+ * @param array $start    ['lat'=>float,'lng'=>float] starting point (worker / depot)
+ * @return array Ordered list of stops with distance and ETA information.
+ */
+function optimise_route(array $requests, array $start): array
+{
+    $pending = $requests;
+    $curLat  = (float) ($start['lat'] ?? DEFAULT_MAP_LAT);
+    $curLng  = (float) ($start['lng'] ?? DEFAULT_MAP_LNG);
+
+    // Guarantee the most urgent request is always visited first.
+    usort($pending, function ($a, $b) {
+        return (int) $b['priority_score'] <=> (int) $a['priority_score'];
+    });
+
+    $stops     = [];
+    $clock     = time();              // simulated departure = now
+    $traveled  = 0.0;
+
+    // Put the top priority request first in the working set.
+    $first = array_shift($pending);
+    $queue = array_merge([$first], $pending);
+
+    while ($queue) {
+        $bestIdx  = 0;
+        $bestCost = INF;
+        $bestDist = 0.0;
+
+        foreach ($queue as $i => $r) {
+            $dist = haversine_km($curLat, $curLng, (float) $r['latitude'], (float) $r['longitude']);
+            // Priority acts as a discount on travelling distance.
+            $discount = ((int) $r['priority_score']) / 100 * PRIORITY_KM;
+            $cost     = $dist - $discount;
+
+            if ($cost < $bestCost) {
+                $bestCost = $cost;
+                $bestIdx  = $i;
+                $bestDist = $dist;
+            }
+        }
+
+        $r = $queue[$bestIdx];
+        array_splice($queue, $bestIdx, 1);
+
+        $travelMin = estimate_drive_minutes($bestDist);
+        $clock    += $travelMin * 60;
+        $eta       = date('Y-m-d H:i:s', $clock);
+        $clock    += SERVICE_MINUTES * 60;
+
+        $stops[] = [
+            'request'          => $r,
+            'stop_number'      => count($stops) + 1,
+            'distance_from_prev_km' => round($bestDist, 2),
+            'distance_score'   => round(max(0, $bestCost), 2),   // debugging aid
+            'eta'              => $eta,
+            'travel_minutes'   => $travelMin,
+        ];
+
+        $traveled += $bestDist;
+        $curLat = (float) $r['latitude'];
+        $curLng = (float) $r['longitude'];
+    }
+
+    return $stops;
+}
+
+/** Total travel time + on-site service time for a set of stops. */
+function plan_duration_minutes(array $stops): int
+{
+    $minutes = 0;
+    foreach ($stops as $s) {
+        $minutes += (int) $s['travel_minutes'] + SERVICE_MINUTES;
+    }
+    return $minutes;
+}
+
+/** Total kilometres for a set of stops. */
+function plan_distance_km(array $stops): float
+{
+    $km = 0.0;
+    foreach ($stops as $s) {
+        $km += (float) $s['distance_from_prev_km'];
+    }
+    return round($km, 2);
+}
+
+/**
+ * Suggest which requests to put on a plan: the most urgent ones that the
+ * worker's team can actually service, capped by the vehicle capacity.
+ *
+ * @param int   $workerId
+ * @param int   $maxStops
+ * @return array{requests:array, skipped:array}
+ */
+function suggest_requests_for_plan(int $workerId, int $maxStops = 8): array
+{
+    $worker = db_row(
+        'SELECT w.*, t.waste_types AS team_waste_types, t.team_name, v.vehicle_number, v.vehicle_type
+           FROM workers w
+           LEFT JOIN teams t    ON t.id = w.team_id
+           LEFT JOIN vehicles v ON v.id = w.vehicle_id
+          WHERE w.id = ?',
+        [$workerId]
+    );
+    if (!$worker) {
+        return ['requests' => [], 'skipped' => []];
+    }
+
+    $candidates = db_all(
+        'SELECT * FROM waste_requests
+          WHERE status IN ("pending","prioritized","assigned","scheduled")
+            AND assigned_worker_id IS NULL
+            AND is_rejected = 0
+          ORDER BY priority_score DESC, created_at ASC'
+    );
+
+    $teamTypes = array_map('trim', explode(',', strtolower((string) ($worker['team_waste_types'] ?? 'all'))));
+    $fits      = in_array('all', $teamTypes, true);
+
+    $chosen  = [];
+    $skipped = [];
+
+    foreach ($candidates as $r) {
+        $ok = $fits || in_array(strtolower((string) $r['waste_type']), $teamTypes, true);
+        if ($ok && count($chosen) < $maxStops) {
+            $chosen[] = $r;
+        } elseif (!$ok) {
+            $skipped[] = $r;
+        } elseif (count($chosen) >= $maxStops) {
+            $skipped[] = $r;
+        }
+    }
+
+    return ['requests' => $chosen, 'skipped' => $skipped];
+}
+
+/**
+ * CREATE a collection plan in the database.
+ *
+ * @param int   $workerId    worker who will run the plan
+ * @param array $requestIds  waste_requests.id values to include
+ * @param string $planDate    Y-m-d
+ * @return array{plan_id:int, plan_code:string, stops:array, distance:float, duration:int}
+ */
+function create_collection_plan(int $workerId, array $requestIds, string $planDate, ?int $createdBy = null): array
+{
+    if (!$requestIds) {
+        throw new RuntimeException('Select at least one request to build a plan.');
+    }
+
+    $worker = db_row(
+        'SELECT w.*, t.team_name, v.vehicle_number
+           FROM workers w
+           LEFT JOIN teams t    ON t.id = w.team_id
+           LEFT JOIN vehicles v ON v.id = w.vehicle_id
+          WHERE w.id = ?',
+        [$workerId]
+    );
+    if (!$worker) {
+        throw new RuntimeException('Worker not found.');
+    }
+
+    // Keep only requests that are still open.
+    $placeholders = implode(',', array_fill(0, count($requestIds), '?'));
+    $rows = db_all(
+        "SELECT * FROM waste_requests
+          WHERE id IN ($placeholders)
+            AND status NOT IN (\"collected\",\"verified\",\"cancelled\")
+            AND is_rejected = 0",
+        array_map('intval', $requestIds)
+    );
+    if (!$rows) {
+        throw new RuntimeException('None of the selected requests are still open for collection.');
+    }
+
+    $start = [
+        'lat' => $worker['latitude'] !== null ? (float) $worker['latitude'] : DEFAULT_MAP_LAT,
+        'lng' => $worker['longitude'] !== null ? (float) $worker['longitude'] : DEFAULT_MAP_LNG,
+    ];
+
+    $stops = optimise_route($rows, $start);
+
+    $distance = plan_distance_km($stops);
+    $duration = plan_duration_minutes($stops);
+
+    // --- Persist plan ------------------------------------------------------
+    $planId = db_insert(
+        'INSERT INTO collection_plans
+            (plan_code, team_id, vehicle_id, worker_id, plan_date, status,
+             total_stops, total_distance_km, estimated_duration_min, created_by, notes)
+         VALUES ("PENDING", ?, ?, ?, ?, "draft", ?, ?, ?, ?, ?)',
+        [
+            $worker['team_id'],
+            $worker['vehicle_id'],
+            $workerId,
+            $planDate,
+            count($stops),
+            $distance,
+            $duration,
+            $createdBy ?? current_user_id(),
+            'Auto-generated by the route optimisation engine',
+        ]
+    );
+
+    $planCode = 'CP-' . date('ymd', strtotime($planDate)) . '-' . str_pad((string) $planId, 3, '0', STR_PAD_LEFT);
+    db_query('UPDATE collection_plans SET plan_code = ? WHERE id = ?', [$planCode, $planId]);
+
+    // --- Persist stops -----------------------------------------------------
+    foreach ($stops as $s) {
+        $r = $s['request'];
+        db_query(
+            'INSERT INTO collection_plan_stops
+                (plan_id, request_id, stop_number, sequence_order, eta, distance_from_prev_km,
+                 travel_minutes, priority_score, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, "pending")',
+            [
+                $planId,
+                (int) $r['id'],
+                $s['stop_number'],
+                $s['stop_number'],
+                $s['eta'],
+                $s['distance_from_prev_km'],
+                $s['travel_minutes'],
+                (int) $r['priority_score'],
+            ]
+        );
+
+        // Link the request to this plan AND to the assigned field team.
+        // Both links matter: the plan screen groups by plan, the field team's
+        // phone groups by assigned_worker_id, and update-status authorises on
+        // assigned_worker_id — so all of them must be written together.
+        db_query(
+            'UPDATE waste_requests
+                SET collection_plan_id = ?, plan_stop_number = ?, status = "scheduled",
+                    assigned_worker_id = ?, assigned_team_id = ?, vehicle_id = ?,
+                    assigned_at = COALESCE(assigned_at, NOW()),
+                    estimated_visit_time = ?, scheduled_at = ?, updated_at = NOW()
+              WHERE id = ?',
+            [
+                $planId,
+                $s['stop_number'],
+                $workerId,
+                $worker['team_id'],
+                $worker['vehicle_id'],
+                $s['eta'],
+                $s['eta'],
+                (int) $r['id'],
+            ]
+        );
+
+        // One open assignment row per request (re-planning reuses it).
+        $openAsg = db_row(
+            'SELECT id FROM assignments
+              WHERE request_id = ? AND status NOT IN ("completed","cancelled")
+              ORDER BY id DESC LIMIT 1',
+            [(int) $r['id']]
+        );
+        if ($openAsg) {
+            db_query(
+                'UPDATE assignments SET worker_id = ?, team_id = ?, vehicle_id = ?, assigned_by = ?,
+                        status = "assigned", accepted_at = NULL, completed_at = NULL
+                  WHERE id = ?',
+                [$workerId, $worker['team_id'], $worker['vehicle_id'], $createdBy ?? current_user_id(), $openAsg['id']]
+            );
+        } else {
+            db_query(
+                'INSERT INTO assignments
+                    (request_id, worker_id, team_id, vehicle_id, assigned_by, distance_km, reason, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, "assigned")',
+                [
+                    (int) $r['id'],
+                    $workerId,
+                    $worker['team_id'],
+                    $worker['vehicle_id'],
+                    $createdBy ?? current_user_id(),
+                    $s['distance_from_prev_km'],
+                    'Assigned through collection plan ' . $planCode,
+                ]
+            );
+        }
+    }
+
+    $workerUser = worker_user_id($workerId);
+    if ($workerUser) {
+        notify(
+            $workerUser,
+            'New collection plan ' . $planCode,
+            count($stops) . ' stops · ' . $distance . ' km · approx ' . fmt_duration($duration),
+            'plan',
+            '/worker/mission.php?plan=' . $planId
+        );
+    }
+
+    log_activity('plan_created', 'collection_plan', $planId,
+        "Plan $planCode created with " . count($stops) . " stops for worker #$workerId");
+
+    return [
+        'plan_id'   => $planId,
+        'plan_code' => $planCode,
+        'stops'     => $stops,
+        'distance'  => $distance,
+        'duration'  => $duration,
+    ];
+}
+
+/**
+ * Manual reordering of stops from the Collection Plan screen.
+ * Recomputes ETA + distances after the new order.
+ */
+function reorder_plan_stops(int $planId, array $orderedStopIds): void
+{
+    $plan = db_row('SELECT * FROM collection_plans WHERE id = ?', [$planId]);
+    if (!$plan) {
+        throw new RuntimeException('Plan not found.');
+    }
+
+    $worker = db_row('SELECT latitude, longitude FROM workers WHERE id = ?', [$plan['worker_id']]);
+    $curLat = $worker && $worker['latitude'] !== null ? (float) $worker['latitude'] : DEFAULT_MAP_LAT;
+    $curLng = $worker && $worker['longitude'] !== null ? (float) $worker['longitude'] : DEFAULT_MAP_LNG;
+
+    $totalDist = 0.0;
+    $totalMin  = 0;
+    // Simulated day clock: the route starts at 09:00 on the plan date.
+    $clock     = strtotime($plan['plan_date'] . ' 09:00:00');
+
+    $pos = 1;
+    foreach ($orderedStopIds as $stopId) {
+        $stop = db_row(
+            'SELECT s.*, r.latitude, r.longitude
+               FROM collection_plan_stops s
+               JOIN waste_requests r ON r.id = s.request_id
+              WHERE s.id = ? AND s.plan_id = ?',
+            [(int) $stopId, $planId]
+        );
+        if (!$stop) {
+            continue;
+        }
+
+        $dist = haversine_km($curLat, $curLng, (float) $stop['latitude'], (float) $stop['longitude']);
+        $travel = estimate_drive_minutes($dist);
+        $clock += $travel * 60;
+        $eta   = date('Y-m-d H:i:s', $clock);
+        $clock += SERVICE_MINUTES * 60;
+
+        db_query(
+            'UPDATE collection_plan_stops
+                SET stop_number = ?, sequence_order = ?, eta = ?, distance_from_prev_km = ?, travel_minutes = ?
+              WHERE id = ?',
+            [$pos, $pos, $eta, round($dist, 2), $travel, (int) $stopId]
+        );
+        db_query('UPDATE waste_requests SET plan_stop_number = ?, scheduled_at = ? WHERE id = ?',
+            [$pos, $eta, (int) $stop['request_id']]);
+
+        $totalDist += $dist;
+        $totalMin  += $travel + SERVICE_MINUTES;
+        $curLat = (float) $stop['latitude'];
+        $curLng = (float) $stop['longitude'];
+        $pos++;
+    }
+
+    db_query(
+        'UPDATE collection_plans SET total_stops = ?, total_distance_km = ?, estimated_duration_min = ? WHERE id = ?',
+        [$pos - 1, round($totalDist, 2), $totalMin, $planId]
+    );
+}
